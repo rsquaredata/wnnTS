@@ -217,12 +217,6 @@ install.packages("devtools")
 devtools::install(".")
 ```
 
-Alternatively, download and install the packaged archive [WNNRina.tar.gz](https://github.com/rsquaredata/wnnTS/raw/refs/heads/main/doc/archive/WNNRina_0.1.0.tar.gz):
-
-```r
-install.packages("WNNRina.tar.gz", repos = NULL, type = "source")
-```
-
 ---
 
 ## Quick Start
