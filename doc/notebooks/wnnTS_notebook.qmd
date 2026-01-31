@@ -1,0 +1,1885 @@
+---
+title: "Time Series Forecasting — Electricity Consumption"
+author: "rsquaredata"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+# Part 1
+
+## 0. Global configuration
+
+### Environment setup
+
+```{r}
+# ============================================================================
+# Environment setup
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+set.seed(123)
+
+# ---------------------------------------------------------------------------
+# Global parameters
+# ---------------------------------------------------------------------------
+freq <- 96   # 15-minute data → daily seasonality (24 * 4)
+h    <- 96   # Forecast horizon (1 full day)
+
+# ---------------------------------------------------------------------------
+# Package management
+# ---------------------------------------------------------------------------
+
+# Core time series & data manipulation
+packages_core <- c(
+  "tidyverse",
+  "lubridate",
+  "readxl",
+  "writexl",
+  "tsintermittent",
+  "zoo"
+)
+
+# Forecasting & statistical models
+packages_ts <- c(
+  "forecast",
+  "tseries"
+)
+
+# Machine Learning
+packages_ml <- c(
+  "randomForest",
+  "xgboost",
+  "e1071",
+  "prophet"
+)
+
+# Visualization & diagnostics
+packages_viz <- c(
+  "ggplot2",
+  "patchwork",
+  "scales"
+)
+
+# Utility packages
+packages_utils <- c(
+  "Metrics",
+  "openxlsx"
+)
+
+# Full package list
+packages_all <- c(
+  packages_core,
+  packages_ts,
+  packages_ml,
+  packages_viz,
+  packages_utils
+)
+
+# ---------------------------------------------------------------------------
+# Install missing packages (if any)
+# ---------------------------------------------------------------------------
+installed <- rownames(installed.packages())
+to_install <- setdiff(packages_all, installed)
+
+if (length(to_install) > 0) {
+  install.packages(to_install, dependencies = TRUE)
+}
+
+# ---------------------------------------------------------------------------
+# Load packages
+# ---------------------------------------------------------------------------
+invisible(lapply(packages_all, library, character.only = TRUE))
+
+# ---------------------------------------------------------------------------
+# Session information (for reproducibility)
+# ---------------------------------------------------------------------------
+sessionInfo()
+```
+
+### Helper functions
+
+```{r}
+# ============================================================================
+# Helper functions (stateful framework)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Global results container (stateful)
+# ---------------------------------------------------------------------------
+
+results <- list(
+  baselines   = list(),
+  ets         = list(),
+  arima       = list(),
+  regression  = list(),
+  ml          = list()
+)
+
+# ---------------------------------------------------------------------------
+# Datetime parsing
+# ---------------------------------------------------------------------------
+
+parse_datetime <- function(x, tz = "Europe/Paris", min_ok_rate = 0.7) {
+  if (inherits(x, "POSIXct")) {
+    return(x)
+  }
+  x <- as.character(x)
+  x <- trimws(x)
+  parsed <- rep(as.POSIXct(NA, tz = tz), length(x))
+  # 1. Excel serial dates
+  num_x <- suppressWarnings(as.numeric(x))
+  is_excel_serial <- !is.na(num_x) & num_x >= 20000 & num_x <= 60000
+  if (any(is_excel_serial)) {
+    tmp <- as.POSIXct(
+      num_x[is_excel_serial] * 86400,
+      origin = "1899-12-30",
+      tz = "UTC"
+    )
+    parsed[is_excel_serial] <- lubridate::force_tz(tmp, tzone = tz)
+  }
+  # 2. Character datetime formats
+  remaining <- is.na(parsed) & x != ""
+  if (any(remaining)) {
+    try_formats <- c(
+      "%Y-%m-%d %H:%M:%S",
+      "%Y-%m-%d %H:%M",
+      "%Y-%m-%dT%H:%M:%S",
+      "%Y-%m-%dT%H:%M:%SZ",
+      "%Y-%m-%d",
+      "%d/%m/%Y %H:%M:%S",
+      "%d/%m/%Y %H:%M",
+      "%d/%m/%Y",
+      "%m/%d/%Y %H:%M:%S",
+      "%m/%d/%Y %H:%M",
+      "%m/%d/%Y"
+    )
+    parsed[remaining] <- suppressWarnings(
+      as.POSIXct(
+        x[remaining],
+        tz = tz,
+        tryFormats = try_formats
+      )
+    )
+  }
+  # 3. Validation
+  ok_rate <- mean(!is.na(parsed))
+  if (ok_rate < min_ok_rate) {
+    stop(
+      sprintf("Datetime parsing failed: only %.0f%% successful.", 100 * ok_rate),
+      call. = FALSE
+    )
+  }
+  parsed
+}
+
+# ---------------------------------------------------------------------------
+# Data loading helper (Excel from URL)
+# ---------------------------------------------------------------------------
+
+read_xlsx_from_url <- function(url) {
+  tmp <- tempfile(fileext = ".xlsx")
+  download.file(url, tmp, mode = "wb", quiet = TRUE)
+  readxl::read_excel(tmp)
+}
+
+# ---------------------------------------------------------------------------
+# Time index diagnostics
+# ---------------------------------------------------------------------------
+
+check_time_regularity <- function(datetime, freq_minutes = 15) {
+  diffs <- diff(datetime)
+  expected <- as.difftime(freq_minutes, units = "mins")
+
+  list(
+    is_regular    = all(diffs == expected),
+    missing_steps = sum(diffs != expected),
+    diff_table    = table(diffs)
+  )
+}
+
+check_time_step <- function(ts, units = "mins") {
+  stopifnot(inherits(ts, "POSIXct"))
+  dt <- base::diff(ts)
+  dt_num <- as.numeric(dt, units = units)
+  cat(capture.output(summary(dt_num)), sep = "\n")
+}
+
+# ---------------------------------------------------------------------------
+# Data overview helper
+# ---------------------------------------------------------------------------
+
+show_overview <- function(data, n = 6) {
+  cat(
+    c(
+      strrep("-", 70),
+      "DATA OVERVIEW",
+      strrep("-", 70),
+      "",
+      paste("Head (first", n, "rows):"),
+      capture.output(head(data, n)),
+      "",
+      "Structure:",
+      capture.output(str(data)),
+      strrep("-", 70)
+    ),
+    sep = "\n"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Error metrics
+# ---------------------------------------------------------------------------
+
+rmse <- function(actual, forecast) {
+  Metrics::rmse(actual, forecast)
+}
+
+mae <- function(actual, forecast) {
+  Metrics::mae(actual, forecast)
+}
+
+mape <- function(actual, forecast) {
+  mean(abs((actual - forecast) / actual), na.rm = TRUE) * 100
+}
+
+# ---------------------------------------------------------------------------
+# Rolling cross-validation engine (fixed window)
+# ---------------------------------------------------------------------------
+
+rolling_cv <- function(
+  y,
+  xreg = NULL,
+  model_fun,
+  model_args = list(),
+  window_size,
+  h = 96,
+  stride = 96,
+  metric_fun = rmse
+) {
+
+  n <- length(y)
+  start_points <- seq(
+    from = n - window_size - h,
+    to   = n - h,
+    by   = stride
+  )
+
+  scores <- numeric(length(start_points))
+
+  for (i in seq_along(start_points)) {
+
+    start <- start_points[i]
+
+    y_train <- y[start:(start + window_size - 1)]
+    y_test  <- y[(start + window_size):(start + window_size + h - 1)]
+
+    if (!is.null(xreg)) {
+      x_train <- xreg[start:(start + window_size - 1), , drop = FALSE]
+      x_test  <- xreg[(start + window_size):(start + window_size + h - 1), , drop = FALSE]
+    }
+
+    model <- do.call(
+      model_fun,
+      c(
+        list(y = y_train),
+        model_args,
+        if (!is.null(xreg)) list(xreg = x_train)
+      )
+    )
+
+    preds <- forecast::forecast(
+      model,
+      h = h,
+      xreg = if (!is.null(xreg)) x_test else NULL
+    )$mean
+
+    scores[i] <- metric_fun(y_test, preds)
+  }
+
+  scores
+}
+
+# ---------------------------------------------------------------------------
+# Result logging (stateful)
+# ---------------------------------------------------------------------------
+
+log_result <- function(
+  family,
+  model_name,
+  params,
+  rmse_values,
+  mae_values = NULL
+) {
+
+  results[[family]][[model_name]] <<- list(
+    params    = params,
+    rmse_mean = mean(rmse_values),
+    rmse_sd   = sd(rmse_values),
+    mae_mean  = if (!is.null(mae_values)) mean(mae_values) else NA,
+    mae_sd    = if (!is.null(mae_values)) sd(mae_values) else NA
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Results summarization
+# ---------------------------------------------------------------------------
+
+summarize_results <- function(family) {
+  tibble::tibble(
+    model     = names(results[[family]]),
+    rmse_mean = sapply(results[[family]], function(x) x$rmse_mean),
+    rmse_sd   = sapply(results[[family]], function(x) x$rmse_sd),
+    mae_mean  = sapply(results[[family]], function(x) x$mae_mean),
+    mae_sd    = sapply(results[[family]], function(x) x$mae_sd)
+  ) %>%
+    arrange(rmse_mean)
+}
+
+# ---------------------------------------------------------------------------
+# Forecast export helper (strict format)
+# ---------------------------------------------------------------------------
+
+export_forecast <- function(forecast_values, path = "YourName.xlsx") {
+  stopifnot(length(forecast_values) == 96)
+
+  writexl::write_xlsx(
+    tibble::tibble(forecast = as.numeric(forecast_values)),
+    path
+  )
+}
+```
+
+## 1. Data ingestion
+
+```{r}
+# ============================================================================
+# Data loading
+# ============================================================================
+
+# Dataset source
+data_url <- "https://site.com/path/to/the/dataset.xksx"
+
+# Load raw dataset
+raw_data <- read_xlsx_from_url(data_url)
+
+# First inspection (raw schema)
+show_overview(raw_data)
+colnames(raw_data)
+```
+
+```{r}
+# Column renaming (canonical schema)
+data <- raw_data %>%
+  rename(
+    timestamp   = `Timestamp`,
+    power       = `Power (kW)`,
+    temperature = `Temp (C°)`
+  )
+
+# Inspection after renaming
+show_overview(data)
+```
+
+## 2. Preprocessing
+
+### Data Cleaning
+
+#### Time index construction and validation
+
+```{r}
+# ============================================================================
+# Time index construction and validation
+# ============================================================================
+
+# Datetime parsing
+data <- data %>%
+  mutate(
+    timestamp = parse_datetime(timestamp, tz = "Europe/Paris")
+  )
+
+# Temporal ordering
+data <- data %>%
+  arrange(timestamp)
+
+# Basic checks
+sum(duplicated(data$timestamp))
+range(data$timestamp)
+
+# Time index diagnostics
+time_regularity <- check_time_regularity(
+  datetime = data$timestamp,
+  freq_minutes = 15
+)
+
+time_regularity
+check_time_step(data$timestamp)
+```
+
+#### Missing values and outliers
+
+```{r}
+# ============================================================================
+# Missing Values and Zeros Diagnostic
+# ============================================================================
+
+# 1. Global counts for Power and Temperature
+quality_report <- data.frame(
+    Variable = c("power", "temperature"),
+    Total_NAs = c(sum(is.na(data$power)), sum(is.na(data$temperature))),
+    Total_Zeros = c(sum(data$power == 0, na.rm = TRUE), sum(data$temperature == 0, na.rm = TRUE))
+)
+
+cat("--- Global Data Quality Report ---\n")
+print(quality_report)
+cat("\n")
+
+# 2. Detailed localization of Power anomalies (NAs and Zeros)
+# We focus on power as it is our main target
+power_issues <- is.na(data$power) | (data$power == 0)
+power_issues[is.na(power_issues)] <- FALSE # Safety
+
+if (any(power_issues)) {
+    # Using rle (Run Length Encoding) to find consecutive sequences
+    runs <- rle(power_issues)
+    
+    # Calculate start and end indices of each sequence of issues
+    end_idx <- cumsum(runs$lengths)
+    start_idx <- end_idx - runs$lengths + 1
+    
+    # Filter only the sequences where issues == TRUE
+    anomaly_details <- data.frame(
+        Start_Timestamp = data$timestamp[start_idx[runs$values]],
+        End_Timestamp   = data$timestamp[end_idx[runs$values]],
+        Duration_Steps  = runs$lengths[runs$values],
+        Type            = ifelse(is.na(data$power[start_idx[runs$values]]), "Missing (NA)", "Zero Value")
+    )
+    
+    cat("--- Detailed Localization of Power Anomalies ---\n")
+    print(anomaly_details)
+} else {
+    cat("No NAs or Zeros detected in Power column.\n")
+}
+na_summary
+```
+
+### Internal Imputation
+
+```{r}
+# ============================================================================
+# Internal Imputation
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Outlier detection
+# ----------------------------------------------------------------------------
+
+# Convert technical zeros (the 11 values on 02/18) into NAs
+# This allows the interpolation function to recognize them as gaps to fill
+data$power[data$power == 0] <- NA
+
+# Boundary for historical data (everything before the target day)
+last_obs_idx <- max(which(!is.na(data$power)))
+
+# ----------------------------------------------------------------------------
+# Linear interpolation
+# ----------------------------------------------------------------------------
+
+# Imputing ONLY the historical gaps (including the new NAs from the zeros)
+# We strictly preserve the 96 NAs at the end of the dataset
+data$power[1:last_obs_idx] <- zoo::na.approx(
+    data$power[1:last_obs_idx], 
+    x = data$timestamp[1:last_obs_idx],
+    na.rm = FALSE
+)
+
+# Safety check: Min value should now be > 0
+cat("Minimum power after cleaning:", min(data$power, na.rm = TRUE), "\n")
+```
+
+### Feature Engineering
+
+```{r}
+# ============================================================================
+# Feature Engineering - Temporal components
+# ============================================================================
+
+# Extracting calendar features for Regression and ML models
+data <- data %>%
+    mutate(
+        hour      = lubridate::hour(timestamp),
+        minute    = lubridate::minute(timestamp),
+        wday      = lubridate::wday(timestamp, week_start = 1), # 1=Monday
+        is_weekend = ifelse(wday %in% c(6, 7), 1, 0),
+        # Fractional day feature (0 to 95)
+        time_index = (hour * 4) + (minute / 15)
+    )
+
+cat("Preprocessing complete. Features created:", 
+    paste(c("hour", "wday", "is_weekend", "time_index"), collapse = ", "), "\n")
+```
+
+## 3. Exploratory Data Analysis
+
+### Visual inspection
+
+```{r}
+plot(data$timestamp, data$power, type = "l", 
+     main = "Cleaned Power Series (Outages Interpolated)",
+     ylab = "kW", xlab = "Time")
+```
+
+### Daily Seasonality Analysis
+
+```{r}
+# Check the average behavior per 15-min interval
+daily_profile <- data %>%
+    filter(!is.na(power)) %>% 
+    mutate(interval = (lubridate::hour(timestamp) * 4) + (lubridate::minute(timestamp) / 15) + 1) %>%
+    group_by(interval) %>%
+    summarise(mean_power = mean(power), .groups = "drop")
+
+plot(daily_profile$interval, daily_profile$mean_power, type = "l", 
+     main = "Average Daily Profile (n=96 intervals)",
+     xlab = "Interval", ylab = "Avg kW")
+```
+
+### Temperature analysis
+
+```{r}
+# ============================================================================
+# Exogenous Variable Analysis: Power vs Temperature
+# ============================================================================
+
+# Correlation calculation (on historical data only)
+historical_data <- data[1:last_obs_idx, ]
+cor_val <- cor(historical_data$power, historical_data$temperature, use = "complete.obs")
+
+cat(sprintf("Pearson Correlation (Power vs Temp): %.3f\n", cor_val))
+
+# Visual check: Scatter plot with regression line
+library(ggplot2)
+ggplot(historical_data, aes(x = temperature, y = power)) +
+    geom_point(alpha = 0.3, color = "steelblue") +
+    geom_smooth(method = "lm", color = "red") +
+    labs(title = "Relationship between Power Consumption and Temperature",
+         subtitle = paste("Correlation:", round(cor_val, 3)),
+         x = "Temperature (°C)", y = "Power (kW)") +
+    theme_minimal()
+```
+
+## 4. Validation strategy
+
+### Rationale for rolling window CV
+
+::: {style="text-align: justify;"}
+Rationale:
+
+1.  Time series data: random splitting is prohibited to avoid data leakage.
+2.  2\. Daily seasonality: each fold should cover at least one full cycle (96 points).
+3.  Forecast horizon: h = 96 (one full day ahead) as per requirements.
+4.  Rolling origin: ensures robust performance evaluation across different days.
+:::
+
+### Generation of cross-validation splits
+
+```{r}
+# Configuration
+h <- 96 
+initial_window_size <- 1344 # 14 days * 96 intervals
+
+# Function to generate rolling indices
+generate_rolling_windows <- function(n_obs, initial_window, horizon, step_size) {
+    splits <- list()
+    start <- initial_window
+    i <- 1
+    
+    # We stop before the 96 NAs of the target day (last_obs_idx)
+    while ((start + horizon) <= last_obs_idx) {
+        splits[[i]] <- list(
+            train = seq_len(start),
+            test  = seq(start + 1, start + horizon)
+        )
+        start <- start + step_size
+        i <- i + 1
+    }
+    return(splits)
+}
+
+# Generate splits using the cleaned history only
+cv_splits <- generate_rolling_windows(
+    n_obs          = last_obs_idx,
+    initial_window = initial_window_size,
+    horizon        = h,
+    step_size      = h
+)
+
+cat("Cross-validation strategy initialized with", length(cv_splits), "folds.\n")
+```
+
+### Visual diagnostic of splits
+
+```{r}
+# ============================================================================
+# Visual diagnostics of splits
+# ============================================================================
+
+plot_rolling_windows <- function(splits, n_obs, max_folds = 5) {
+    # We plot only the first few folds to keep the plot readable
+    folds_to_plot <- seq_len(min(length(splits), max_folds))
+
+    plot(
+        NULL,
+        xlim = c(1, n_obs),
+        ylim = c(0.5, length(folds_to_plot) + 0.5),
+        xlab = "Time index",
+        ylab = "CV fold",
+        yaxt = "n",
+        main = "Rolling Window Visualization (First 5 Folds)"
+    )
+    axis(2, at = folds_to_plot)
+
+    for (i in folds_to_plot) {
+        segments(
+            x0 = min(splits[[i]]$train),
+            x1 = max(splits[[i]]$train),
+            y0 = i,
+            col = "black",
+            lwd = 2
+        )
+        segments(
+            x0 = min(splits[[i]]$test),
+            x1 = max(splits[[i]]$test),
+            y0 = i,
+            col = "red",
+            lwd = 2
+        )
+    }
+
+    legend(
+        "bottomright",
+        legend = c("Train", "Test"),
+        col    = c("black", "red"),
+        lwd    = 2,
+        bty    = "n"
+    )
+}
+
+plot_rolling_windows(cv_splits, last_obs_idx)
+```
+
+## 5. Modeling
+
+### Baseline models
+
+```{r}
+# ============================================================================
+# 5.1. Baseline models — Naive / Seasonal Naive / Random Walk with Drift
+# ============================================================================
+
+# Containers
+rmse_naive  <- numeric(length(cv_splits))
+mae_naive   <- numeric(length(cv_splits))
+
+rmse_snaive <- numeric(length(cv_splits))
+mae_snaive  <- numeric(length(cv_splits))
+
+rmse_rwd    <- numeric(length(cv_splits))
+mae_rwd     <- numeric(length(cv_splits))
+
+# ---------------------------------------------------------------------------
+# Rolling CV loop
+# ---------------------------------------------------------------------------
+
+for (i in seq_along(cv_splits)) {
+
+    split <- cv_splits[[i]]
+
+    y_train <- data$power[split$train]
+    y_test  <- data$power[split$test]
+
+    ts_train <- ts(y_train, frequency = freq)
+
+    # 1. Naive (Benchmark: tomorrow = today's last value)
+    fc_naive <- forecast::naive(ts_train, h = h)
+    rmse_naive[i] <- rmse(y_test, as.numeric(fc_naive$mean))
+    mae_naive[i]  <- mae(y_test,  as.numeric(fc_naive$mean))
+
+    # 2. Seasonal Naive (Benchmark: tomorrow = same time yesterday)
+    fc_snaive <- forecast::snaive(ts_train, h = h)
+    rmse_snaive[i] <- rmse(y_test, as.numeric(fc_snaive$mean))
+    mae_snaive[i]  <- mae(y_test,  as.numeric(fc_snaive$mean))
+
+    # 3. Random Walk with Drift (Benchmark: naive + historical average slope)
+    fc_rwd <- forecast::rwf(ts_train, h = h, drift = TRUE)
+    rmse_rwd[i] <- rmse(y_test, as.numeric(fc_rwd$mean))
+    mae_rwd[i]  <- mae(y_test,  as.numeric(fc_rwd$mean))
+}
+
+# ---------------------------------------------------------------------------
+# Logging results for final comparison
+# ---------------------------------------------------------------------------
+
+log_result("baselines", "Naive", "None", rmse_naive, mae_naive)
+log_result("baselines", "SNaive", "freq=96", rmse_snaive, mae_snaive)
+log_result("baselines", "RWD", "drift=TRUE", rmse_rwd, mae_rwd)
+
+# ---------------------------------------------------------------------------
+# Consolidated results table
+# ---------------------------------------------------------------------------
+
+baseline_results <- summarize_results("baselines")
+print(baseline_results)
+```
+
+### Deterministic exponential smoothing models
+
+#### Simple Exponential Smoothing
+
+```{r}
+# ============================================================================
+# Simple Exponential Smoothing (SES)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# SES via ets() (automatic optimization)
+# ---------------------------------------------------------------------------
+ses_ets_rmse <- numeric(length(cv_splits))
+ses_ets_mae  <- numeric(length(cv_splits))
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    # Simple Exponential Smoothing = ETS(A,N,N)
+    fit <- ets(y_train_ts, model = "ANN")
+    fc  <- forecast(fit, h = h)
+    
+    ses_ets_rmse[k] <- rmse(y_test, as.numeric(fc$mean))
+    ses_ets_mae[k]  <- mae(y_test, as.numeric(fc$mean))
+}
+
+# ---------------------------------------------------------------------------
+# SES via manual grid search
+# ---------------------------------------------------------------------------
+alpha_grid <- data.frame(alpha = seq(0.001, 0.05, by = 0.001))
+alpha_grid$RMSE <- NA_real_
+alpha_grid$MAE  <- NA_real_
+
+for (i in seq_len(nrow(alpha_grid))) {
+    a <- alpha_grid$alpha[i]
+    rmse_folds <- numeric(length(cv_splits))
+    mae_folds  <- numeric(length(cv_splits))
+    
+    for (k in seq_along(cv_splits)) {
+        split <- cv_splits[[k]]
+        y_train_ts <- ts(data$power[split$train], frequency = freq)
+        y_test     <- data$power[split$test]
+        
+        fit <- ses(y_train_ts, alpha = a, h = h)
+        
+        rmse_folds[k] <- rmse(y_test, as.numeric(fit$mean))
+        mae_folds[k]  <- mae(y_test, as.numeric(fit$mean))
+    }
+    alpha_grid$RMSE[i] <- mean(rmse_folds)
+    alpha_grid$MAE[i]  <- mean(mae_folds)
+}
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+cat("--- Automatic SES (ets function) ---\n")
+cat(sprintf("Average RMSE: %.2f | Average MAE: %.2f\n\n", 
+            mean(ses_ets_rmse), mean(ses_ets_mae)))
+
+cat("--- Manual SES (Grid Search Top 10) ---\n")
+ses_results_sorted <- alpha_grid[order(alpha_grid$RMSE), ]
+print(head(ses_results_sorted, 10), row.names = FALSE)
+
+best_ses <- ses_results_sorted[1, ]
+cat(
+  sprintf(
+    "\nBest SES manual model: alpha = %.3f | RMSE = %.2f | MAE = %.2f\n",
+    best_ses$alpha, best_ses$RMSE, best_ses$MAE
+  )
+)
+
+log_result("ets", "SES_Auto", "model=ANN", ses_ets_rmse, ses_ets_mae)
+log_result("ets", "SES_Manual", sprintf("alpha=%.3f", best_ses$alpha), 
+           alpha_grid$RMSE[order(alpha_grid$RMSE)[1]], 
+           alpha_grid$MAE[order(alpha_grid$RMSE)[1]])
+```
+
+#### Holt Linear Trend
+
+```{r}
+# ============================================================================
+# 5.2.1. Holt Linear Trend (Damped and Non-Damped)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Holt via ets() (automatic optimization)
+# ---------------------------------------------------------------------------
+
+holt_ets_rmse <- numeric(length(cv_splits))
+holt_ets_mae  <- numeric(length(cv_splits))
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    capture.output(
+        fit <- try(ets(y_train_ts, model = "AAN", damped = FALSE), silent = TRUE)
+    )
+    
+    if (!inherits(fit, "try-error")) {
+        fc <- forecast(fit, h = h)
+        holt_ets_rmse[k] <- rmse(y_test, as.numeric(fc$mean))
+        holt_ets_mae[k]  <- mae(y_test, as.numeric(fc$mean))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Holt via manual grid search
+# ---------------------------------------------------------------------------
+
+holt_grid <- expand.grid(
+    alpha  = seq(0.001, 0.02, by = 0.001),
+    beta   = seq(0.001, 0.02, by = 0.001),
+    damped = c(TRUE, FALSE)
+)
+
+holt_grid$RMSE <- NA_real_
+holt_grid$MAE  <- NA_real_
+
+for (i in seq_len(nrow(holt_grid))) {
+    a <- holt_grid$alpha[i]; b <- holt_grid$beta[i]; d <- holt_grid$damped[i]
+    
+    rmse_folds <- numeric(length(cv_splits))
+    mae_folds  <- numeric(length(cv_splits))
+    valid_fold_count <- 0
+
+    for (k in seq_along(cv_splits)) {
+        split <- cv_splits[[k]]
+        y_train_ts <- ts(data$power[split$train], frequency = freq)
+        y_test     <- data$power[split$test]
+        
+        capture.output(
+            fit <- try(holt(y_train_ts, alpha = a, beta = b, damped = d, h = h), silent = TRUE)
+        )
+        
+        if (!inherits(fit, "try-error")) {
+            valid_fold_count <- valid_fold_count + 1
+            rmse_folds[k] <- rmse(y_test, as.numeric(fit$mean))
+            mae_folds[k]  <- mae(y_test, as.numeric(fit$mean))
+        }
+    }
+    
+    if (valid_fold_count == length(cv_splits)) {
+        holt_grid$RMSE[i] <- mean(rmse_folds)
+        holt_grid$MAE[i]  <- mean(mae_folds)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Final output
+# ---------------------------------------------------------------------------
+
+cat("--- Automatic Holt (ets function) ---\n")
+cat(sprintf("Average RMSE: %.2f | Average MAE: %.2f\n\n", 
+            mean(holt_ets_rmse), mean(holt_ets_mae)))
+
+# Remove NAs before sorting to avoid 0/Inf issues
+holt_results_clean <- holt_grid[!is.na(holt_grid$RMSE) & holt_grid$RMSE > 0, ]
+
+cat("--- Manual Holt (Grid Search Top 10) ---\n")
+if (nrow(holt_results_clean) > 0) {
+    holt_results_sorted <- holt_results_clean[order(holt_results_clean$RMSE), ]
+    print(head(holt_results_sorted, 10), row.names = FALSE)
+
+    best_holt <- holt_results_sorted[1, ]
+    cat(
+      sprintf(
+        "\nBest Holt manual model: alpha = %.3f | beta = %.3f | damped = %s | RMSE = %.2f | MAE = %.2f\n",
+        best_holt$alpha, best_holt$beta, as.character(best_holt$damped), 
+        best_holt$RMSE, best_holt$MAE
+      )
+    )
+    
+    log_result("ets", "Holt_Auto", "model=AAN", holt_ets_rmse, holt_ets_mae)
+    log_result("ets", "Holt_Manual", sprintf("a=%.2f,b=%.2f,d=%s", best_holt$alpha, best_holt$beta, best_holt$damped), 
+               holt_results_sorted$RMSE[1], holt_results_sorted$MAE[1])
+} else {
+    cat("No valid Holt models found in Grid Search.\n")
+}
+```
+
+#### Holt-Winters
+
+```{r}
+# ============================================================================
+# Holt-Winters (Additive vs Multiplicative)
+# ============================================================================
+
+hw_grid <- expand.grid(
+    alpha    = seq(0.001, 0.006, by = 0.001),
+    beta     = seq(0.001, 0.006, by = 0.001),
+    gamma    = seq(0.015, 0.25, by = 0.01),
+    seasonal = c("additive", "multiplicative")
+)
+
+hw_grid$RMSE <- NA_real_
+hw_grid$MAE  <- NA_real_
+
+for (i in seq_len(nrow(hw_grid))) {
+    
+    a <- hw_grid$alpha[i]
+    b <- hw_grid$beta[i]
+    g <- hw_grid$gamma[i]
+    s <- as.character(hw_grid$seasonal[i])
+    
+    rmse_folds <- numeric(length(cv_splits))
+    mae_folds  <- numeric(length(cv_splits))
+    valid_fold_count <- 0
+
+    for (k in seq_along(cv_splits)) {
+        split <- cv_splits[[k]]
+        y_train_ts <- ts(data$power[split$train], frequency = freq)
+        y_test     <- data$power[split$test]
+        
+        fit <- try(
+            HoltWinters(y_train_ts, alpha = a, beta = b, gamma = g, seasonal = s), 
+            silent = TRUE
+        )
+        
+        if (!inherits(fit, "try-error")) {
+            valid_fold_count <- valid_fold_count + 1
+            preds <- predict(fit, n.ahead = h)
+            rmse_folds[k] <- rmse(y_test, as.numeric(preds))
+            mae_folds[k]  <- mae(y_test, as.numeric(preds))
+        }
+    }
+    
+    if (valid_fold_count == length(cv_splits)) {
+        hw_grid$RMSE[i] <- mean(rmse_folds)
+        hw_grid$MAE[i]  <- mean(mae_folds)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Final output
+# ---------------------------------------------------------------------------
+
+# Filter and split results for logging
+hw_res_clean <- hw_grid[!is.na(hw_grid$RMSE), ]
+hw_res_add   <- hw_res_clean[hw_res_clean$seasonal == "additive", ]
+hw_res_mult  <- hw_res_clean[hw_res_clean$seasonal == "multiplicative", ]
+
+cat("--- Top 5 Holt-Winters Additive ---\n")
+print(head(hw_res_add[order(hw_res_add$RMSE), ], 5), row.names = FALSE)
+
+cat("\n--- Top 5 Holt-Winters Multiplicative ---\n")
+print(head(hw_res_mult[order(hw_res_mult$RMSE), ], 5), row.names = FALSE)
+
+# Identify absolute best
+best_hw <- hw_res_clean[order(hw_res_clean$RMSE), ][1, ]
+
+cat(sprintf(
+    "\nBest HW Overall: type = %s | alpha = %.3f | beta = %.3f | gamma = %.3f | RMSE = %.2f | MAE = %.2f\n",
+    best_hw$seasonal, best_hw$alpha, best_hw$beta, best_hw$gamma, best_hw$RMSE, best_hw$MAE
+))
+
+# Log results
+log_result("ets", "HW_Additive", "a,b,g optimized", 
+           hw_res_add$RMSE[order(hw_res_add$RMSE)[1]], 
+           hw_res_add$MAE[order(hw_res_add$RMSE)[1]])
+
+log_result("ets", "HW_Multiplicative", "a,b,g optimized", 
+           hw_res_mult$RMSE[order(hw_res_mult$RMSE)[1]], 
+           hw_res_mult$MAE[order(hw_res_mult$RMSE)[1]])
+```
+
+```{r}
+# ============================================================================
+# Residuals analysis for the best Holt-Winters model
+# ============================================================================
+
+if (nrow(hw_res_clean) > 0) {
+    
+    # Identify best parameters from our grid
+    best_hw <- hw_res_clean[order(hw_res_clean$RMSE), ][1, ]
+    
+    # Re-fit the best model on the full historical series (all data before target)
+    y_train_full <- ts(data$power[1:last_obs_idx], frequency = freq)
+    
+    final_hw_fit <- HoltWinters(
+        y_train_full, 
+        alpha    = best_hw$alpha, 
+        beta     = best_hw$beta, 
+        gamma    = best_hw$gamma, 
+        seasonal = as.character(best_hw$seasonal)
+    )
+    
+    # 1. Visual Diagnostics & Ljung-Box Test
+    # This provides ACF of residuals and the p-value for the Ljung-Box test
+    checkresiduals(final_hw_fit)
+    
+    # 2. Detailed comments for the report
+    cat("\n--- Residuals Diagnostic: Best HW (", as.character(best_hw$seasonal), ") ---\n")
+    
+    # Residuals mean should be close to zero
+    res_mean <- mean(resid(final_hw_fit))
+    cat(sprintf("Mean of residuals: %.4f (Should be close to 0)\n", res_mean))
+    
+    # We can also check for normality
+    shapiro_test <- shapiro.test(sample(as.numeric(resid(final_hw_fit)), 500)) # Sample for Shapiro
+    cat(sprintf("Shapiro-Wilk normality p-value (sample): %.4f\n", shapiro_test$p.value))
+}
+```
+
+### Stochastic models - ARIMA family
+
+#### auto.ARIMA identification
+
+```{r}
+# ============================================================================
+# auto.ARIMA identification
+# ============================================================================
+
+# We use the complete series up to the last known observation
+y_train_full <- ts(data$power[1:last_obs_idx], frequency = freq)
+
+capture.output(
+    fit_auto <- try(auto.arima(y_train_full, 
+                               seasonal = TRUE, 
+                               stepwise = TRUE,      # to be faster
+                               approximation = TRUE, # because high frequency
+                               allowdrift = FALSE, 
+                               parallel = FALSE),    # to avoid cluster conflicts
+                    silent = TRUE)
+)
+
+if (!inherits(fit_auto, "try-error")) {
+    cat("--- Résultat de auto.arima ---\n")
+    print(fit_auto)
+    
+    # Automatic extraction of orders for the next chunks
+    p_opt <- fit_auto$arma[1]
+    q_opt <- fit_auto$arma[2]
+    P_opt <- fit_auto$arma[3]
+    Q_opt <- fit_auto$arma[4]
+    d_opt <- fit_auto$arma[6]
+    D_opt <- fit_auto$arma[7]
+    
+    cat(sprintf("\nOrders identified : SARIMA(%d,%d,%d)(%d,%d,%d)[%d]\n", 
+                p_opt, d_opt, q_opt, P_opt, D_opt, Q_opt, freq))
+} else {
+    cat("Error : auto.arima failed. Using a standard model (1,1,1)(0,1,1)[96]\n")
+    p_opt <- 1; d_opt <- 1; q_opt <- 1
+    P_opt <- 0; D_opt <- 1; Q_opt <- 1
+}
+```
+
+#### SARIMA
+
+```{r}
+# ============================================================================
+# 5.3. SARIMA - Rolling CV
+# ============================================================================
+
+sarima_rmse <- numeric(length(cv_splits))
+sarima_mae  <- numeric(length(cv_splits))
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    fit <- try(Arima(y_train_ts, 
+                     order = c(p_opt, d_opt, q_opt), 
+                     seasonal = list(order = c(P_opt, D_opt, Q_opt), period = freq)), 
+               silent = TRUE)
+    
+    if (!inherits(fit, "try-error")) {
+        fc <- forecast(fit, h = h)
+        sarima_rmse[k] <- rmse(y_test, as.numeric(fc$mean))
+        sarima_mae[k]  <- mae(y_test, as.numeric(fc$mean))
+    }
+}
+
+cat(sprintf("SARIMA (%d,%d,%d)(%d,%d,%d) - Mean RMSE: %.2f | Mean MAE: %.2f\n", 
+            p_opt, d_opt, q_opt, P_opt, D_opt, Q_opt, 
+            mean(sarima_rmse, na.rm = TRUE), mean(sarima_mae, na.rm = TRUE)))
+
+log_result("sarima", "SARIMA_Auto", 
+           sprintf("(%d,%d,%d)(%d,%d,%d)", p_opt, d_opt, q_opt, P_opt, D_opt, Q_opt), 
+           sarima_rmse, sarima_mae)
+```
+
+#### SARIMA manual test
+
+```{r}
+# ============================================================================
+# SARIMA manual test: (1,0,0)(1,1,0)[96]
+# ============================================================================
+
+# Configuration manuelle
+p_man <- 1; d_man <- 0; q_man <- 0
+P_man <- 1; D_man <- 1; Q_man <- 0
+
+sarima_man_rmse <- numeric(length(cv_splits))
+sarima_man_mae  <- numeric(length(cv_splits))
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    # Fit du modèle (1,0,0)(1,1,0)
+    fit <- try(Arima(y_train_ts, 
+                     order = c(p_man, d_man, q_man), 
+                     seasonal = list(order = c(P_man, D_man, Q_man), period = freq)), 
+               silent = TRUE)
+    
+    if (!inherits(fit, "try-error")) {
+        fc <- forecast(fit, h = h)
+        sarima_man_rmse[k] <- rmse(y_test, as.numeric(fc$mean))
+        sarima_man_mae[k]  <- mae(y_test, as.numeric(fc$mean))
+    }
+}
+
+# --- Output ---
+cat(sprintf("SARIMA (%d,%d,%d)(%d,%d,%d) - Mean RMSE: %.2f | Mean MAE: %.2f\n", 
+            p_man, d_man, q_man, P_man, D_man, Q_man, 
+            mean(sarima_man_rmse, na.rm = TRUE), mean(sarima_man_mae, na.rm = TRUE)))
+
+# Enregistrement du résultat
+log_result("sarima", "SARIMA_Manual_100_110", 
+           sprintf("(%d,%d,%d)(%d,%d,%d)", p_man, d_man, q_man, P_man, D_man, Q_man), 
+           sarima_man_rmse, sarima_man_mae)
+```
+
+#### SARIMAX
+
+```{r}
+# ============================================================================
+# 5.4. SARIMAX - Rolling CV (1,0,0)(1,1,0) + Temperature
+# ============================================================================
+
+p_man <- 1; d_man <- 0; q_man <- 0
+P_man <- 1; D_man <- 1; Q_man <- 0
+
+sarimax_rmse <- numeric(length(cv_splits))
+sarimax_mae  <- numeric(length(cv_splits))
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    # Exogenous matrices
+    xreg_train <- as.matrix(data$temperature[split$train])
+    xreg_test  <- as.matrix(data$temperature[split$test])
+    
+    fit_x <- try(Arima(y_train_ts, 
+                       order = c(p_man, d_man, q_man), 
+                       seasonal = list(order = c(P_man, D_man, Q_man), period = freq),
+                       xreg = xreg_train), 
+                 silent = TRUE)
+    
+    if (!inherits(fit_x, "try-error")) {
+        fc_x <- forecast(fit_x, h = h, xreg = xreg_test)
+        sarimax_rmse[k] <- rmse(y_test, as.numeric(fc_x$mean))
+        sarimax_mae[k]  <- mae(y_test, as.numeric(fc_x$mean))
+    }
+}
+
+cat(sprintf("SARIMAX (1,0,0)(1,1,0) + Temp - Mean RMSE: %.2f | Mean MAE: %.2f\n", 
+            mean(sarimax_rmse, na.rm = TRUE), mean(sarimax_mae, na.rm = TRUE)))
+
+log_result("sarima", "SARIMAX_Manual_Temp", "Exog=Temp | (1,0,0)(1,1,0)", sarimax_rmse, sarimax_mae)
+```
+
+### Regression-based models
+
+```{r}
+# ============================================================================
+# 5.5. Regression-Based Models
+# ============================================================================
+
+reg_results <- list(
+    linear = list(rmse = numeric(length(cv_splits)), mae = numeric(length(cv_splits))),
+    quad   = list(rmse = numeric(length(cv_splits)), mae = numeric(length(cv_splits))),
+    nnar   = list(rmse = numeric(length(cv_splits)), mae = numeric(length(cv_splits)))
+)
+
+for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    train_df <- data[split$train, ]
+    test_df  <- data[split$test, ]
+    
+    # Conversion to ts for NNAR
+    y_train_ts <- ts(train_df$power, frequency = freq)
+    
+    # 1. Linear Trend (Power ~ time_index)
+    m_lin <- lm(power ~ time_index, data = train_df)
+    p_lin <- predict(m_lin, newdata = test_df)
+    reg_results$linear$rmse[k] <- rmse(test_df$power, p_lin)
+    reg_results$linear$mae[k]  <- mae(test_df$power, p_lin)
+    
+    # 2. Quadratic Trend (Power ~ time_index + time_index^2)
+    m_quad <- lm(power ~ poly(time_index, 2), data = train_df)
+    p_quad <- predict(m_quad, newdata = test_df)
+    reg_results$quad$rmse[k] <- rmse(test_df$power, p_quad)
+    reg_results$quad$mae[k]  <- mae(test_df$power, p_quad)
+    
+    # 3. NNAR (Neural Network Autoregression)
+    capture.output(
+        fit_nn <- nnetar(y_train_ts)
+    )
+    fc_nn <- forecast(fit_nn, h = h)
+    reg_results$nnar$rmse[k] <- rmse(test_df$power, as.numeric(fc_nn$mean))
+    reg_results$nnar$mae[k]  <- mae(test_df$power, as.numeric(fc_nn$mean))
+}
+
+# --- Results Summary ---
+
+cat("--- Regression-Based Models Summary ---\n")
+cat(sprintf("Linear Regression (time_index)  | RMSE: %.2f | MAE: %.2f\n", 
+            mean(reg_results$linear$rmse), mean(reg_results$linear$mae)))
+cat(sprintf("Quadratic Regression (poly 2)   | RMSE: %.2f | MAE: %.2f\n", 
+            mean(reg_results$quad$rmse), mean(reg_results$quad$mae)))
+cat(sprintf("NNAR (Neural Network)           | RMSE: %.2f | MAE: %.2f\n", 
+            mean(reg_results$nnar$rmse), mean(reg_results$nnar$mae)))
+
+# Logging
+log_result("regression", "Linear_Reg", "time_index", reg_results$linear$rmse, reg_results$linear$mae)
+log_result("regression", "Quadratic_Reg", "poly_time_index", reg_results$quad$rmse, reg_results$quad$mae)
+log_result("regression", "NNAR", "nnetar_default", reg_results$nnar$rmse, reg_results$nnar$mae)
+```
+
+```{r}
+# ============================================================================
+# NNAR - Fine-tuning grid search
+# ============================================================================
+
+nnar_grid <- expand.grid(
+  p       = c(1, 5, 10, 20), # Autoregressive lags
+  P       = c(1, 2),         # Seasonal lags
+  size    = c(5, 10, 20),    # Nodes in hidden layer
+  repeats = c(20)            # Number of networks to average
+)
+
+nnar_grid$RMSE <- NA_real_
+
+cat(sprintf("Starting NNAR Tuning: %d combinations on 35 folds...\n", nrow(nnar_grid)))
+
+for (i in 1:nrow(nnar_grid)) {
+  fold_rmse <- numeric(length(cv_splits))
+  
+  for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    y_train_ts <- ts(data$power[split$train], frequency = freq)
+    y_test     <- data$power[split$test]
+    
+    fit_nn <- try(nnetar(y_train_ts, 
+                         p = nnar_grid$p[i], 
+                         P = nnar_grid$P[i], 
+                         size = nnar_grid$size[i], 
+                         repeats = nnar_grid$repeats[i]), 
+                  silent = TRUE)
+    
+    if (!inherits(fit_nn, "try-error")) {
+      fc_nn <- forecast(fit_nn, h = h)
+      fold_rmse[k] <- rmse(y_test, as.numeric(fc_nn$mean))
+    }
+  }
+  
+  nnar_grid$RMSE[i] <- mean(fold_rmse, na.rm = TRUE)
+  cat(sprintf("Config %d/%d | p=%d, P=%d, size=%d -> RMSE: %.2f\n", 
+              i, nrow(nnar_grid), nnar_grid$p[i], nnar_grid$P[i], nnar_grid$size[i], nnar_grid$RMSE[i]))
+}
+
+# Identify the best model
+best_nnar_idx <- which.min(nnar_grid$RMSE)
+best_nnar <- nnar_grid[best_nnar_idx, ]
+
+cat("\n--- Best NNAR Configuration ---\n")
+print(best_nnar)
+
+log_result("regression", "NNAR_Tuned", 
+           sprintf("p=%d, P=%d, size=%d", best_nnar$p, best_nnar$P, best_nnar$size), 
+           nnar_grid$RMSE[best_nnar_idx], NA)
+```
+
+### Machine Learning models
+
+#### Random Forest
+
+```{r}
+# ============================================================================
+# Random Forest - Optimized Tuning
+# ============================================================================
+
+rf_tuning_grid <- expand.grid(
+  mtry     = c(2, 3), # approx sqrt(p) and p/2
+  ntree    = c(500),  # I think 500 is stable enough
+  nodesize = c(1, 5)
+)
+
+rf_tuning_grid$RMSE <- NA_real_
+
+cat("Starting RF Fine-tuning (Reduced Grid)...\n")
+
+for(i in 1:nrow(rf_tuning_grid)) {
+  fold_rmse <- numeric(length(cv_splits))
+  
+  for(k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    
+    train_y <- as.numeric(data$power[split$train])
+    train_x <- data[split$train, features]
+    
+    m_rf <- randomForest(
+      x        = train_x, 
+      y        = train_y,
+      mtry     = rf_tuning_grid$mtry[i],
+      ntree    = rf_tuning_grid$ntree[i],
+      nodesize = rf_tuning_grid$nodesize[i]
+    )
+    
+    preds <- predict(m_rf, newdata = data[split$test, features])
+    fold_rmse[k] <- rmse(data$power[split$test], preds)
+  }
+  rf_tuning_grid$RMSE[i] <- mean(fold_rmse)
+  cat(sprintf("Config %d/%d - Mean RMSE: %.2f\n", i, nrow(rf_tuning_grid), rf_tuning_grid$RMSE[i]))
+}
+
+best_rf_conf <- rf_tuning_grid[which.min(rf_tuning_grid$RMSE), ]
+
+# Re-train best RF model using the best parameters found during tuning
+# This model uses all available historical data
+final_m_rf <- randomForest(
+    x        = data[1:last_obs_idx, features], 
+    y        = data$power[1:last_obs_idx],
+    mtry     = best_rf_conf$mtry,
+    nodesize = best_rf_conf$nodesize,
+    ntree    = 500,
+    importance = TRUE
+)
+
+# Visualization feature importance
+varImpPlot(final_m_rf, main = "Feature Importance - Best Random Forest Configuration")
+```
+
+#### XGBoost
+
+```{r}
+# ============================================================================
+# XGBoost - Fine-tuning grid search
+# ============================================================================
+
+xgb_grid <- expand.grid(
+  eta       = c(0.01, 0.05, 0.1),
+  max_depth = c(3, 5, 7, 10),
+  subsample = c(0.6, 0.8, 1)
+)
+
+xgb_grid$RMSE <- NA_real_
+
+# Features used for training
+features <- c("hour", "wday", "is_weekend", "time_index", "temperature")
+
+cat(sprintf("Starting XGBoost Tuning: %d combinations on 35 folds...\n", nrow(xgb_grid)))
+
+for (i in 1:nrow(xgb_grid)) {
+  fold_rmse <- numeric(length(cv_splits))
+  
+  for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    
+    # Prepare DMatrix
+    dtrain <- xgb.DMatrix(data = as.matrix(data[split$train, features]), 
+                          label = data$power[split$train])
+    dtest  <- xgb.DMatrix(data = as.matrix(data[split$test, features]), 
+                          label = data$power[split$test])
+    
+    params <- list(
+      objective = "reg:squarederror",
+      eta       = xgb_grid$eta[i],
+      max_depth = xgb_grid$max_depth[i],
+      subsample = xgb_grid$subsample[i]
+    )
+    
+    # Training with early stopping to prevent overfitting
+    # nrounds is set high, but early_stopping will cut it short
+    capture.output(
+      m_xgb <- xgb.train(
+        params              = params, 
+        data                = dtrain, 
+        nrounds             = 500, # Max rounds
+        evals               = list(val = dtest),
+        early_stopping_rounds = 10,
+        print_every_n       = 100,
+        verbose             = 0
+      )
+    )
+    
+    # Predict using the best iteration
+    preds <- predict(m_xgb, dtest)
+    fold_rmse[k] <- rmse(data$power[split$test], preds)
+  }
+  
+  xgb_grid$RMSE[i] <- mean(fold_rmse, na.rm = TRUE)
+  cat(sprintf("Config %d/%d | eta=%.2f, depth=%d, sub=%.1f -> RMSE: %.2f\n", 
+              i, nrow(xgb_grid), xgb_grid$eta[i], xgb_grid$max_depth[i], 
+              xgb_grid$subsample[i], xgb_grid$RMSE[i]))
+}
+
+# Identify best parameters
+best_xgb_idx <- which.min(xgb_grid$RMSE)
+best_xgb <- xgb_grid[best_xgb_idx, ]
+
+cat("\n--- Best XGBoost Configuration ---\n")
+print(best_xgb)
+
+log_result("ml", "XGBoost_Tuned", 
+           sprintf("eta=%.2f, depth=%d, sub=%.1f", best_xgb$eta, best_xgb$max_depth, best_xgb$subsample), 
+           xgb_grid$RMSE[best_xgb_idx], NA)
+
+
+# Re-training the best XGBoost model to visualize FI
+# 1. Prepare the full historical data matrix
+dtrain_final <- xgb.DMatrix(
+    data  = as.matrix(data[1:last_obs_idx, features]), 
+    label = data$power[1:last_obs_idx]
+)
+# 2. Re-train using the best parameters from xgb_grid
+final_m_xgb <- xgb.train(
+    params    = list(
+        objective = "reg:squarederror", 
+        eta       = best_xgb$eta, 
+        max_depth = best_xgb$max_depth, 
+        subsample = best_xgb$subsample
+    ),
+    data      = dtrain_final,
+    nrounds   = 100 # rounds adjusted based on early stopping results
+)
+
+# 3. Calculate and visualize importance
+importance_matrix <- xgb.importance(feature_names = features, model = final_m_xgb)
+
+# Using the native XGBoost plotting function
+xgb.plot.importance(importance_matrix, 
+                     main = "Feature Importance - Best XGBoost Configuration (Gain)")
+```
+
+#### Support Vector Regression (SVR)
+
+```{r}
+# ============================================================================
+# SVR - Fine-tuning grid search
+# ============================================================================
+
+# Defining the grid with a step to avoid thousands of combinations on 35 folds
+svr_grid <- expand.grid(
+  cost    = 2^seq(-5, 15, by = 4),   # Cost of constraints violation
+  gamma   = 2^seq(-15, 3, by = 4),   # Kernel parameter
+  epsilon = c(0.01, 0.05, 0.1)       # Insensitivity tube width
+)
+
+svr_grid$RMSE <- NA_real_
+
+features <- c("hour", "wday", "is_weekend", "time_index", "temperature")
+
+cat(sprintf("Starting SVR Tuning: %d combinations on 35 folds...\n", nrow(svr_grid)))
+
+for (i in 1:nrow(svr_grid)) {
+  fold_rmse <- numeric(length(cv_splits))
+  
+  for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    
+    # SVR is sensitive to scaling; svm() scales by default
+    m_svr <- try(svm(
+      x = data[split$train, features], 
+      y = data$power[split$train],
+      kernel  = "radial",
+      cost    = svr_grid$cost[i],
+      gamma   = svr_grid$gamma[i],
+      epsilon = svr_grid$epsilon[i]
+    ), silent = TRUE)
+    
+    if (!inherits(m_svr, "try-error")) {
+      preds <- predict(m_svr, newdata = data[split$test, features])
+      fold_rmse[k] <- rmse(data$power[split$test], preds)
+    }
+  }
+  
+  svr_grid$RMSE[i] <- mean(fold_rmse, na.rm = TRUE)
+  cat(sprintf("Config %d/%d | C=%.2f, g=%.5f, eps=%.2f -> RMSE: %.2f\n", 
+              i, nrow(svr_grid), svr_grid$cost[i], svr_grid$gamma[i], 
+              svr_grid$epsilon[i], svr_grid$RMSE[i]))
+  
+  # Clean memory
+  if(i %% 5 == 0) gc()
+}
+
+# Identify best parameters
+best_svr_idx <- which.min(svr_grid$RMSE)
+best_svr <- svr_grid[best_svr_idx, ]
+
+cat("\n--- Best SVR Configuration ---\n")
+print(best_svr)
+
+log_result("ml", "SVR_Tuned", 
+           sprintf("C=%.2f, g=%.5f, eps=%.2f", best_svr$cost, best_svr$gamma, best_svr$epsilon), 
+           svr_grid$RMSE[best_svr_idx], NA)
+```
+
+```{r}
+# Flash test flash on SVR
+m_svr_test <- svm(power ~ hour + wday + is_weekend + time_index + temperature, 
+                 data = data[cv_splits[[1]]$train, ], 
+                 kernel = "radial",
+                 cost = 1000,   # high but reasonable cost
+                 gamma = 0.5)   # stronger gamma to capture peaks
+preds_test <- predict(m_svr_test, data[cv_splits[[1]]$test, ])
+rmse(data$power[cv_splits[[1]]$test], preds_test)
+```
+
+#### Prophet
+
+```{r}
+# ============================================================================
+# Prophet - Tuning + Component analysis
+# ============================================================================
+
+prophet_grid <- expand.grid(
+  changepoint_prior_scale = c(0.01, 0.05, 0.1, 0.5),
+  seasonality_mode        = c("additive", "multiplicative"),
+  fourier_order           = c(5, 10, 15, 20)
+)
+
+prophet_grid$RMSE <- NA_real_
+
+cat(sprintf("Starting Prophet Tuning: %d combinations on 35 folds...\n", nrow(prophet_grid)))
+
+# Grid search with rolling cross-validation
+for (i in 1:nrow(prophet_grid)) {
+  fold_rmse <- numeric(length(cv_splits))
+  
+  for (k in seq_along(cv_splits)) {
+    split <- cv_splits[[k]]
+    
+    # Prepare data for Prophet
+    train_df <- data[split$train, ] %>% 
+      select(timestamp, power, temperature) %>%
+      rename(ds = timestamp, y = power)
+    
+    test_df <- data[split$test, ] %>% 
+      select(timestamp, power, temperature) %>%
+      rename(ds = timestamp, y = power)
+    
+    # Initialize model
+    m_tune <- prophet(
+      changepoint.prior.scale = prophet_grid$changepoint_prior_scale[i],
+      seasonality.mode        = prophet_grid$seasonality_mode[i],
+      daily.seasonality       = FALSE 
+    )
+    
+    # Add custom daily seasonality and temperature
+    m_tune <- add_seasonality(m_tune, name = 'daily', period = 1, 
+                              fourier.order = prophet_grid$fourier_order[i])
+    m_tune <- add_regressor(m_tune, 'temperature')
+    
+    # Fit model
+    capture.output(m_tune <- fit.prophet(m_tune, train_df))
+    
+    # Predict and calculate error
+    future <- test_df %>% select(ds, temperature)
+    forecast_tune <- predict(m_tune, future)
+    fold_rmse[k] <- rmse(test_df$y, forecast_tune$yhat)
+  }
+  
+  prophet_grid$RMSE[i] <- mean(fold_rmse, na.rm = TRUE)
+  cat(sprintf("Config %d/%d | CPS=%.2f, Mode=%s, Fourier=%d -> RMSE: %.2f\n", 
+              i, nrow(prophet_grid), prophet_grid$changepoint_prior_scale[i], 
+              prophet_grid$seasonality_mode[i], prophet_grid$fourier_order[i], 
+              prophet_grid$RMSE[i]))
+}
+
+# Identify and log best parameters
+best_prophet_idx <- which.min(prophet_grid$RMSE)
+best_prophet <- prophet_grid[best_prophet_idx, ]
+
+cat("\n--- Best Prophet Configuration ---\n")
+print(best_prophet)
+
+log_result("ml", "Prophet_Tuned", 
+           sprintf("CPS=%.2f, Mode=%s, Fourier=%d", 
+                   best_prophet$changepoint_prior_scale, 
+                   best_prophet$seasonality_mode, 
+                   best_prophet$fourier_order), 
+           prophet_grid$RMSE[best_prophet_idx], NA)
+
+# Re-train best model on full history for component analysis
+cat("\nRe-training final Prophet model for component visualization...\n")
+
+df_final <- data[1:last_obs_idx, ] %>% 
+  select(timestamp, power, temperature) %>%
+  rename(ds = timestamp, y = power)
+
+final_m_prophet <- prophet(
+  changepoint.prior.scale = best_prophet$changepoint_prior_scale,
+  seasonality.mode        = best_prophet$seasonality_mode,
+  daily.seasonality       = FALSE
+)
+
+final_m_prophet <- add_seasonality(final_m_prophet, name = 'daily', period = 1, 
+                                   fourier.order = best_prophet$fourier_order)
+final_m_prophet <- add_regressor(final_m_prophet, 'temperature')
+
+final_m_prophet <- fit.prophet(final_m_prophet, df_final)
+final_forecast <- predict(final_m_prophet, df_final)
+
+# Visualize components (Trend, Weekly, Daily, Temperature effect)
+prophet_plot_components(final_m_prophet, final_forecast)
+```
+
+## 6. Model Selection
+
+```{r}
+names(data)
+```
+
+```{r}
+# 1. Determine the split point
+total_rows <- nrow(data)
+last_obs_idx <- total_rows - 96 
+
+# 2. Isolate the target day (96 rows)
+future_data <- data[(last_obs_idx + 1):total_rows, ]
+
+# 3. Double check the timestamp of the first and last row of future_data
+print(head(future_data$timestamp, 1))
+print(tail(future_data$timestamp, 1))
+```
+
+```{r}
+# ============================================================================
+# MODEL SELECTION, FULL RETRAINING & EXPORT
+# ============================================================================
+
+# Features identified from data names
+final_features <- c("hour", "wday", "is_weekend", "time_index", "temperature")
+
+# 1. Prepare matrices
+dtrain_all <- xgb.DMatrix(
+  data  = as.matrix(data[1:last_obs_idx, final_features]), 
+  label = data$power[1:last_obs_idx]
+)
+
+dtest_feb19 <- xgb.DMatrix(
+  data = as.matrix(future_data[, final_features])
+)
+
+# 2. Retrain champion (XGBoost - Config 5)
+final_model <- xgb.train(
+  params  = list(objective = "reg:squarederror", eta = 0.05, max_depth = 5, subsample = 0.6),
+  data    = dtrain_all,
+  nrounds = 150
+)
+
+# 3. Predict
+final_forecast <- predict(final_model, dtest_feb19)
+
+# 4. Sanity checks
+# Should be 96
+length(final_forecast) 
+# Should show the first numeric values
+head(final_forecast)
+
+# 5. Export results
+file_name <- "YourName.xlsx"
+write.xlsx(data.frame(final_forecast), file_name, colNames = FALSE)
+```
+
+# Part 2
+
+This is a quick tutorial to show how to create a minimal R package on macOS.  
+Adapt paths and system dependencies for other operating systems.
+
+Prerequisites (recommended):
+- R ≥ 4.2
+- RStudio
+- Xcode Command Line Tools installed (`xcode-select --install`)
+
+Open the R console and type the following (replace `yourname` with your actual name):
+
+## 1. Create the package
+
+```r
+# Check/set the correct work directory
+getwd()
+setwd("/Users/yourname/wnnTS")
+
+# Install development tools (once)
+install.packages(c("devtools", "usethis", "roxygen2", "knitr", "rmarkdown"))
+
+library(usethis)
+
+# Create the package
+create_package("~/wnnTS")
+```
+
+## 2. Create engine file
+
+```r
+use_r("predict_wnn")
+```
+
+Copy the following in `R/predict_wwn.R`and save:
+
+```r
+#' Weighted Nearest Neighbors Forecast
+#'
+#' @param train_y Numeric vector of historical power consumption.
+#' @param window_size Integer. Size of the pattern to match (e.g. 96).
+#' @param k Integer. Number of nearest neighbors.
+#' @param forecast_h Integer. Forecast horizon.
+#'
+#' @return Numeric vector of length `forecast_h`.
+#' @export
+predict_wnn <- function(train_y,
+                        window_size = 96,
+                        k = 5,
+                        forecast_h = 96) {
+
+  n <- length(train_y)
+
+  stopifnot(
+    is.numeric(train_y),
+    n > window_size + forecast_h,
+    k > 0
+  )
+
+  current_window <- train_y[(n - window_size + 1):n]
+
+  search_limit <- n - window_size - forecast_h
+
+  distances <- vapply(
+    seq_len(search_limit),
+    function(i) {
+      past_window <- train_y[i:(i + window_size - 1)]
+      sum((current_window - past_window)^2)
+    },
+    numeric(1)
+  )
+
+  neighbor_indices <- order(distances)[seq_len(k)]
+
+  weights <- 1 / (distances[neighbor_indices] + 1e-6)^2
+  weights <- weights / sum(weights)
+
+  predictions <- sapply(
+    neighbor_indices,
+    function(idx) {
+      train_y[(idx + window_size):(idx + window_size + forecast_h - 1)]
+    }
+  )
+
+  as.numeric(predictions %*% weights)
+}
+```
+
+## 3. DESCRIPTION
+
+### Initiate DESCRIPTION
+
+```r
+use_description(
+  fields = list(
+    Title = "Weighted Nearest Neighbors for Electricity Load Forecasting",
+    Description = "Implements a Weighted Nearest Neighbors (WNN) algorithm for
+    short-term electricity consumption forecasting using inverse squared
+    distance weighting on historical patterns.",
+    License = "GPL-3"
+  )
+)
+```
+
+### Edit DESCRIPTION
+
+```r
+Package: wnnTS
+Type: Package
+Title: Weighted Nearest Neighbors for Electricity Load Forecasting
+Version: 0.1.0
+Authors@R: 
+    person("YourFirstName", "YourLastName", email = "your@emailaddress.com", role = c("aut", "cre"))
+Description: Implements a Weighted Nearest Neighbors (WNN) algorithm for
+    short-term electricity consumption forecasting using inverse squared
+    distance weighting on historical patterns.
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+Imports:
+    stats
+Suggests:
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
+RoxygenNote: 7.3.3
+
+```
+
+## 4. NAMESPACE
+
+```r
+devtools::document()
+```
+
+## 5. Vignette
+
+### Initiate Vignette
+
+```r
+use_vignette("Vignette")
+```
+
+### Edit Vignette
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## 6. Test the package locally
+
+```r
+devtools::load_all()
+predict_wnn(rnorm(500))
+```
+
+## 7. Build a packaged archive (optional but recommended)
+
+```r
+devtools::document()
+devtools::check()
+devtools::build()
+```
