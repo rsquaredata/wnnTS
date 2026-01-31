@@ -1,6 +1,6 @@
 <div align="center">
 
-# wnnTS
+# WNNRina
 
 ### *Weighted Nearest Neighbors for Electricity Load Forecasting*
 
@@ -38,7 +38,7 @@
 
 ## Overview
 
-**wnnTS** is an academic project dedicated to **electricity load forecasting** using classical, machine learning, and weighted nearest neighbors models.
+**WNNRina** is an academic project dedicated to **electricity load forecasting** using classical, machine learning, and weighted nearest neighbors models.
 
 Provided a dataset containing electricity consumption (kW) and outdoor air temperature (°C), both measured every **15 minutes** for a single building over **49 days**, the goal is to forecast electricity consumption for the **50th day (96 time steps)**, given historical consumption data and known temperature values for the forecast horizon.
 
@@ -263,7 +263,7 @@ The entire project is fully reproducible.
 All data preprocessing, exploratory analysis, model benchmarking, and hyperparameter tuning are implemented in a single Quarto notebook.  
 To reproduce the full workflow:
 
-1. Download the [Quarto notebook](doc/notebooks/wnnTS_notebook.qmd) from the repository
+1. Download the [Quarto notebook](doc/notebooks/WNNRina_notebook.qmd) from the repository
 2. Open it in [**RStudio**](https://posit.co/download/rstudio-desktop/)
 3. Run the notebook from start to end
 
@@ -284,7 +284,7 @@ To reproduce the full workflow:
 ## Project Structure
 
 ```
-wnnTS/
+WNNRina/
 │
 ├── R/                  # WNN implementation
 ├── man/                # Documentation
@@ -327,7 +327,7 @@ Talavera-Llames, R.L., Pérez-Chacón, R., Martínez-Ballesteros, M., Troncoso, 
 
 <div align="center">
 
-wnnTS — Weighted Nearest Neighbors for Electricity Load Forecasting
+WNNRina — Weighted Nearest Neighbors for Electricity Load Forecasting
 
 </div>
 
